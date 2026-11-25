@@ -270,9 +270,178 @@ X-XSS-Protection: 1; mode=block
 
 ---
 
-## Part 4: API Security
+## Part 4: API Security (`04-api-gateway/`)
 
-*(Pending CP3)*
+### Exercise 4.1: API Key Authentication (`04-api-gateway/develop/`)
+
+#### Live Test Outputs (`AGENT_API_KEY=secret-key-123`, port `8004`)
+
+**(a) Missing `X-API-Key` header → `401 Unauthorized`**
+```http
+HTTP/1.1 401 Unauthorized
+date: Wed, 25 Nov 2026 07:13:18 GMT
+server: uvicorn
+content-length: 67
+content-type: application/json
+
+{"detail":"Missing API key. Include header: X-API-Key: <your-key>"}
+```
+
+**(b) Wrong `X-API-Key` header (`wrong-key`) → `403 Forbidden`**
+```http
+HTTP/1.1 403 Forbidden
+date: Wed, 25 Nov 2026 07:13:18 GMT
+server: uvicorn
+content-length: 29
+content-type: application/json
+
+{"detail":"Invalid API key."}
+```
+
+**(c) Valid `X-API-Key: secret-key-123` → `200 OK`**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:18 GMT
+server: uvicorn
+content-length: 114
+content-type: application/json
+
+{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé."}
+```
+
+#### Analysis (Exercise 4.1 Questions)
+1. **Where the API key is checked:**
+   - In `04-api-gateway/develop/app.py`, `api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)` extracts the `X-API-Key` header.
+   - `verify_api_key(api_key: str = Security(api_key_header))` checks it against `API_KEY = os.getenv("AGENT_API_KEY", "demo-key-change-in-production")`, and is injected into the protected endpoint via `_key: str = Depends(verify_api_key)` on `@app.post("/ask")`. (`GET /` and `GET /health` remain public.)
+2. **Error behavior:**
+   - Missing header (`not api_key`) raises `HTTPException(status_code=401, detail="Missing API key. Include header: X-API-Key: <your-key>")`.
+   - Mismatched key (`api_key != API_KEY`) raises `HTTPException(status_code=403, detail="Invalid API key.")`.
+   - Note: an empty `question` after passing auth raises `422` (`question is required`).
+3. **Zero-downtime key rotation strategy:**
+   - Support an overlap window with **multiple active keys** (e.g., `AGENT_API_KEYS` comma-separated or `AGENT_API_KEY` + `AGENT_API_KEY_PREVIOUS` loaded into a `set` and checked with constant-time comparison `hmac.compare_digest`).
+   - Rollout steps: (1) add the new key alongside the old key on the server and redeploy, (2) update clients/callers to send the new key, (3) verify traffic has shifted off the old key via logs/metrics, (4) remove the old key from the environment and redeploy.
+
+---
+
+### Exercise 4.2 & 4.3: JWT Authentication & Rate Limiting (`04-api-gateway/production/`)
+
+#### Live Test Outputs (port `8004`, JWT tokens redacted)
+
+**(a) `POST /ask` without token → `401 Unauthorized`**
+```http
+HTTP/1.1 401 Unauthorized
+date: Wed, 25 Nov 2026 07:13:19 GMT
+server: uvicorn
+www-authenticate: Bearer
+content-length: 76
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":"Authentication required. Include: Authorization: Bearer <token>"}
+```
+
+**(b) Login at `POST /auth/token` (`student` / `demo123`) → `200 OK`**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:19 GMT
+server: uvicorn
+content-length: 307
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"access_token":"<REDACTED_JWT_TOKEN>","token_type":"bearer","expires_in_minutes":60,"hint":"Include in header: Authorization: Bearer <REDACTED_JWT_PREFIX>..."}
+```
+
+**(c) `POST /ask` with `Authorization: Bearer <REDACTED_JWT_TOKEN>` → `200 OK`**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:19 GMT
+server: uvicorn
+content-length: 192
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"Explain JWT","answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận.","usage":{"requests_remaining":9,"budget_remaining_usd":1.9e-05}}
+```
+
+**(d) Rate limit loop (12 sequential `POST /ask` calls as `student`) — `200 OK` down to `requests_remaining: 0`, then `429 Too Many Requests`:**
+- Calls 1–9 succeed with `200 OK` (`requests_remaining` counts down from `8` to `0`, after the initial call above already used 1 of the 10-request window).
+- Call 10 (11th total call in the 60s window) is rejected with `429 Too Many Requests`:
+
+Call 9 (`200 OK`, last allowed request in window):
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:20 GMT
+server: uvicorn
+content-length: 211
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"question":"Test 9","answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic.","usage":{"requests_remaining":0,"budget_remaining_usd":0.000181}}
+```
+
+Call 10 (`429 Too Many Requests` with `X-RateLimit-*` and `Retry-After` headers):
+```http
+HTTP/1.1 429 Too Many Requests
+date: Wed, 25 Nov 2026 07:13:20 GMT
+server: uvicorn
+x-ratelimit-limit: 10
+x-ratelimit-remaining: 0
+x-ratelimit-reset: 1795590860
+retry-after: 59
+content-length: 98
+content-type: application/json
+x-content-type-options: nosniff
+x-frame-options: DENY
+x-xss-protection: 1; mode=block
+referrer-policy: strict-origin-when-cross-origin
+
+{"detail":{"error":"Rate limit exceeded","limit":10,"window_seconds":60,"retry_after_seconds":59}}
+```
+
+#### Exercise 4.3 Questions
+1. **Algorithm used (`04-api-gateway/production/rate_limiter.py`):**
+   - **Sliding Window** implemented with a per-user `collections.deque` of UNIX timestamps (`self._windows[user_id]`).
+   - On each `check(user_id)`, expired timestamps (`window[0] < now - self.window_seconds`) are popped from the left. If `len(window) >= self.max_requests`, it raises HTTP `429` with `X-RateLimit-Limit`, `X-RateLimit-Remaining: 0`, `X-RateLimit-Reset`, and `Retry-After` computed from the oldest active timestamp (`int(oldest + window_seconds - now) + 1`). Otherwise it appends `now`.
+2. **Configured limits & role-based selection:**
+   - `rate_limiter_user`: **10 requests / 60 seconds** (used for `"user"` role, e.g., `student`).
+   - `rate_limiter_admin`: **100 requests / 60 seconds** (used for `"admin"` role, e.g., `teacher`).
+   - In `04-api-gateway/production/app.py`, `ask_agent` selects the limiter by role:
+     `limiter = rate_limiter_admin if role == "admin" else rate_limiter_user`.
+     To bypass rate limiting completely for admins, guard the check with `if role != "admin": rate_info = limiter.check(username)`.
+3. **Why Redis is needed in multi-instance deployments:**
+   - `RateLimiter._windows` lives in local process memory. Behind a load balancer with `N` instances, each instance maintains an independent `deque`, so a user could send up to `N × 10` req/min (and counters reset whenever a container restarts).
+   - Storing rate-limit state in **Redis** (e.g., sorted set `ZADD`/`ZREMRANGEBYSCORE`/`ZCARD` or atomic `INCR` + `EXPIRE` counter keys) gives every instance a single shared, persistent view of each user's quota.
+
+---
+
+### Exercise 4.4: Cost Guard Implementation & Rationale
+
+1. **How Cost Guard works (`04-api-gateway/production/cost_guard.py` + Redis pattern):**
+   - **Per-user & global budgets:** `CostGuard` enforces both a per-user daily budget (`daily_budget_usd = 1.0`) and a global daily cap (`global_daily_budget_usd = 10.0`).
+   - **Pre-call check & status codes:** `check_budget(user_id)` runs *before* calling the LLM. If the global budget is exhausted, it returns `503 Service Unavailable`; if the user's budget is exhausted, it raises `402 Payment Required`.
+   - **Warning threshold:** When `record.total_cost_usd >= daily_budget_usd * warn_at_pct` (`0.8`, i.e., 80%), it logs a warning (`User <id> at X% budget`) before the hard block is hit.
+   - **Token accounting:** After `ask()` completes, `record_usage(user_id, input_tokens, output_tokens)` computes USD cost (`$0.00015 / 1K input`, `$0.0006 / 1K output`) and increments both the user's total and `_global_cost`.
+   - **Redis key design for production (`INCRBYFLOAT` + `EXPIRE`):**
+     - Instead of in-memory dicts, track spend in Redis keyed by user and billing window:
+       - Per-user key: `budget:{user_id}:{YYYY-MM}` (monthly, `EXPIRE` 32 days = `2764800`s) or `budget:{user_id}:{YYYY-MM-DD}` (daily, `EXPIRE` 2 days = `172800`s).
+       - Global key: `budget:global:{YYYY-MM-DD}` (or `{YYYY-MM}`).
+     - Pre-check reads `float(r.get(key) or 0)` against the cap (`402` if exceeded); after the LLM call (or with estimated cost before the call), `r.incrbyfloat(key, cost)` atomically adds the spend and `r.expire(key, ttl)` ensures automatic period reset without manual cron cleanup.
+2. **Why BOTH Rate Limiting and Cost Guard are needed:**
+   - **Rate limiting protects speed/availability (anti-DoS & burst control):** It caps request frequency (e.g., 10 req/min) so traffic spikes don't saturate workers or downstream APIs. However, a patient attacker or script sending 9 large-context requests every minute for 24 hours stays below the rate limit while generating huge LLM token bills.
+   - **Cost guard protects money/LLM token budget:** It caps cumulative dollar spend (per-user and global) over a day or month. However, cost guard alone doesn't stop rapid-fire bursts of short/cheap requests (or auth/validation spam) from overloading the service. Together, rate limiting bounds *throughput* while cost guard bounds *financial exposure*.
 
 ---
 
