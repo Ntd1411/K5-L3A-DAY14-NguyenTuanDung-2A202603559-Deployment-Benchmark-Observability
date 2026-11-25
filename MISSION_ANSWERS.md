@@ -600,12 +600,58 @@ Total messages: 10
 
 ---
 
-## Part 6: Final Project — Production AI Agent
+## Part 6: Final Project — Production AI Agent (`06-lab-complete/`)
 
-*(Pending CP5)*
+### Full Verification Output (`check_production_ready.py`)
+
+Command: `cd 06-lab-complete && ../.venv/bin/python check_production_ready.py` (exit code `0`)
+
+```text
+================================================================
+  📋 Checklist Deliverable
+     ✅ Dockerfile (multi-stage, < 500 MB)
+     ✅ docker-compose.yml (agent + redis)
+     ✅ .dockerignore
+     ✅ Health check endpoint (GET /health)
+     ✅ Readiness endpoint (GET /ready)
+     ✅ API Key authentication
+     ✅ Rate limiting
+     ✅ Cost guard
+     ✅ Config từ environment variables
+     ✅ Structured logging
+     ✅ Graceful shutdown
+     ✅ Public URL ready (Railway / Render config)
+----------------------------------------------------------------
+  Result: 12/12 tiêu chí đạt · 43/43 checks passed
+  🎉 PASS 12/12 — PRODUCTION READY! Deploy nào!
+================================================================
+```
+
+### Implementation Summary (`06-lab-complete/`)
+
+- **`06-lab-complete/app/config.py`**: `Settings` dataclass loading `PORT` (8000), `ENVIRONMENT` (`development`), `DEBUG` (`False`), `AGENT_API_KEY` (`""`), `REDIS_URL` (`redis://localhost:6379/0`), `RATE_LIMIT_PER_MINUTE` (10), `DAILY_BUDGET_USD` (1.0), and `MONTHLY_BUDGET_USD` (10.0) via `os.getenv` after `dotenv.load_dotenv(override=False)`.
+- **`06-lab-complete/app/redis_client.py`**: Lazy `redis.from_url(..., decode_responses=True, socket_connect_timeout=2, socket_timeout=2)` (no import-time ping), `redis_healthy() -> bool` returning `False` on any exception, and `close_redis()` for shutdown cleanup.
+- **`06-lab-complete/app/auth.py`**: `APIKeyHeader(name="X-API-Key", auto_error=False)` with `verify_api_key` using `secrets.compare_digest`, raising HTTP `401` on missing/empty/invalid key.
+- **`06-lab-complete/app/rate_limiter.py`**: `check_rate_limit(key)` using Redis sorted-set 60s sliding window (`ZREMRANGEBYSCORE` → `ZCARD` → `ZADD` + `EXPIRE`), returning HTTP `429` with `Retry-After` header, with in-memory fallback strictly on `redis.RedisError` (stateless test confirmed `429` persists after agent restart).
+- **`06-lab-complete/app/cost_guard.py`**: Tracks `cost:daily:{YYYY-MM-DD}` (TTL `172800`s) and `cost:monthly:{YYYY-MM}` (TTL `3024000`s) via `INCRBYFLOAT` + `EXPIRE` (fallback only on `redis.RedisError`). `check_budget()` raises HTTP `402` when daily or monthly budget is reached; `record_cost(input_tokens, output_tokens)` records and returns request USD cost.
+- **`06-lab-complete/app/main.py`**:
+  - `JsonFormatter` emitting single-line JSON logs (`ts`, `lvl`, `logger`, `msg`, plus structured `extra` fields) on stdout (verified 12 valid JSON log lines).
+  - `lifespan` async context manager logging startup/shutdown and closing Redis without overriding uvicorn's `SIGTERM` handler (graceful shutdown exited with code `0` while completing in-flight request with `200`).
+  - HTTP request logging middleware (`event`, `method`, `path`, `status`, `ms`).
+  - Exception handlers returning clean `422` JSON for `RequestValidationError` and `{"error": "Internal server error"}` (`500`) without leaking stack traces.
+  - Endpoints: `GET /health` (always `200`), `GET /ready` (`200` when Redis healthy, `503` when Redis down), `POST /ask` (auth → rate limit → budget check → `llm_ask` → `record_cost` → response with `cost_usd`).
+- **`06-lab-complete/Dockerfile` & `.dockerignore`**: Multi-stage `python:3.11-slim` build (`builder` installs to `/install`, `runtime` copies `/install` to `/usr/local`), non-root `appuser`, `HEALTHCHECK` against `/health`, `CMD ["sh", "-c", "exec uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 2"]`. Built image size: **235 MB** (< 500 MB); `docker stop` exited with code `0` in **1.4s** (independent verifier run: **1.2s**).
+- **`06-lab-complete/docker-compose.yml`, `.env.example`, `railway.toml`, `render.yaml`**: Compose defines `agent` (`REDIS_URL=redis://redis:6379/0`, `env_file` with `required: false`, `depends_on: redis: condition: service_healthy`) and `redis:7-alpine` with `redis-cli ping` healthcheck (`docker compose config` validated without `.env`). Platform configs provide `railway.toml` (`builder = "DOCKERFILE"`, `healthcheckPath = "/health"`) and `render.yaml` (`type: web`, `runtime: docker`, `healthCheckPath: /health`, `AGENT_API_KEY` with `generateValue: true`, `REDIS_URL` with `sync: false`).
 
 ---
 
 ## AI log
 
-*(Pending CP5)*
+| Checkpoint | Prompt / Task Asked | AI Assistance Received | Manual Review, Edits & Verification |
+|------------|---------------------|------------------------|-------------------------------------|
+| **CP0 — Setup** | Verify local Python 3.11, Docker, Docker Compose, create `.venv`, and initialize `MISSION_ANSWERS.md`. | Generated the initial `MISSION_ANSWERS.md` template and verification commands. | Ran `git remote -v`, `python -c "import os; print(os.name)"`, `python --version`, `docker --version`, `docker compose version`, `docker run --rm hello-world`, and `.venv/bin/python` import checks locally; verified exact outputs before committing `MISSION_ANSWERS.md`. |
+| **CP1 — Localhost vs Production** | Identify anti-patterns in `01-localhost-vs-production/develop/app.py`, map fixes in `production/`, and summarize Exercise 1.1–1.3. | Structured the 7 anti-pattern/fix mappings and comparison table from source inspection. | Verified every cited line number in `develop/app.py`, `production/app.py`, and `production/config.py`; ran both servers live via `.venv`, recorded real `curl -i` outputs (including port-8000 conflict behavior on `develop`), and checked no secrets were leaked. |
+| **CP2 — Docker** | Analyze single-stage vs multi-stage Dockerfiles (`02-docker/`) and Compose networking for Exercise 2.1–2.4. | Drafted Dockerfile Q&A, multi-stage layer analysis, and Compose architecture diagram. | Built `my-agent:develop` and `my-agent:advanced` from repo root, measured real byte/MB sizes via `docker images` and `docker image inspect` (`1,662.98 MB` vs `237.37 MB`, `85.73%` reduction), tested `cp2-dev` and `k5-day14-docker` via Nginx `/health` & `/ask`, and cleaned up all containers/images. |
+| **CP3 — API Security** | Explain API key auth, JWT auth, sliding-window rate limiting, and Redis Cost Guard (`04-api-gateway/`). | Summarized `rate_limiter.py` / `cost_guard.py` mechanics, zero-downtime key rotation, and Redis `INCRBYFLOAT` + `EXPIRE` key design. | Ran `04-api-gateway/develop` and `04-api-gateway/production` on port `8004`, executed live `curl -i` tests for `401`, `403`, `200`, and `429` (`Retry-After` / `X-RateLimit-*` headers), and redacted all JWT tokens before saving outputs. |
+| **CP4 — Scaling & Reliability** | Explain liveness vs readiness, `SIGTERM` vs `SIGKILL`, and Redis stateless session sharing (`05-scaling-reliability/`). | Drafted probe/signal explanations and Redis session serialization summary. | Ran `05-scaling-reliability/develop` on port `8005` and verified an in-flight 3s `/ask` request finished `200 OK` across `kill -TERM`; scaled `05-scaling-reliability/production` to `--scale agent=3`, ran `test_stateless.py` hitting all 3 instances with 10 intact messages, and ran `docker compose -p k5-day14-scaling down -v`. |
+| **CP5 — Final Project (`06-lab-complete/`)** | Implement all TODOs across `app/*.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, and `render.yaml`. | Drafted `Settings`, lazy Redis client, `secrets.compare_digest` API key auth, Redis ZSET sliding-window rate limiter, Redis `INCRBYFLOAT` cost guard, JSON logging, `lifespan`, multi-stage Dockerfile, and PaaS manifests. | Verified `git diff 06-lab-complete/check_production_ready.py` is empty, ran `check_production_ready.py --static-only` (28/28) and full `check_production_ready.py` with Docker (`PASS 12/12`, `43/43 checks passed`, `235 MB` image), verified `docker compose config` without `.env`, tested clean `422` validation errors, and confirmed zero secrets/PII in staged files. |
