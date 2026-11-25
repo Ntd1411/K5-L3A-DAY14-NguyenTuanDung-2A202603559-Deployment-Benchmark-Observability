@@ -445,9 +445,158 @@ referrer-policy: strict-origin-when-cross-origin
 
 ---
 
-## Part 5: Scaling & Reliability
+## Part 5: Scaling & Reliability (`05-scaling-reliability/`)
 
-*(Pending CP4)*
+### Exercise 5.1 & 5.2: Health Checks & Graceful Shutdown (`05-scaling-reliability/develop/`)
+
+#### Live Test Outputs (port `8005`)
+
+**(a) `GET /health` (Liveness Probe) → `200 OK`**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:23 GMT
+server: uvicorn
+content-length: 185
+content-type: application/json
+
+{"status":"ok","uptime_seconds":0.4,"version":"1.0.0","environment":"development","timestamp":"2026-11-25T07:13:24.078434+00:00","checks":{"memory":{"status":"ok","used_percent":43.5}}}
+```
+
+**(b) `GET /ready` (Readiness Probe) → `200 OK`**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:23 GMT
+server: uvicorn
+content-length: 37
+content-type: application/json
+
+{"ready":true,"in_flight_requests":1}
+```
+
+**(c) In-flight `POST /ask?question=Long+task` (~3s mock LLM delay) + `kill -TERM 145672` after `0.5s`:**
+
+Client `curl -i` output (completed cleanly with `200 OK` instead of dropping):
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:13:23 GMT
+server: uvicorn
+content-length: 126
+content-type: application/json
+
+{"answer":"Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ OpenAI/Anthropic."}
+```
+
+Server log showing request completion and graceful shutdown sequence:
+```text
+2026-11-25 14:13:23,633 INFO Starting agent on port 8005
+INFO:     Started server process [145672]
+INFO:     Waiting for application startup.
+2026-11-25 14:13:23,654 INFO Agent starting up...
+2026-11-25 14:13:23,654 INFO Loading model and checking dependencies...
+2026-11-25 14:13:23,854 INFO ✅ Agent is ready!
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8005 (Press CTRL+C to quit)
+INFO:     127.0.0.1:40958 - "GET /ready HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40972 - "GET /health HTTP/1.1" 200 OK
+INFO:     127.0.0.1:40976 - "GET /ready HTTP/1.1" 200 OK
+INFO:     Shutting down
+INFO:     127.0.0.1:40978 - "POST /ask?question=Long+task HTTP/1.1" 200 OK
+INFO:     Waiting for application shutdown.
+2026-11-25 14:13:27,245 INFO 🔄 Graceful shutdown initiated...
+2026-11-25 14:13:27,245 INFO ✅ Shutdown complete
+INFO:     Application shutdown complete.
+INFO:     Finished server process [145672]
+2026-11-25 14:13:27,246 INFO Received signal 15 — uvicorn will handle graceful shutdown
+```
+
+#### Explanations (Exercise 5.1 & 5.2)
+1. **Liveness (`GET /health`) vs Readiness (`GET /ready`):**
+   - **Liveness (`/health`)** answers *"Is the process alive and not deadlocked?"*. Orchestrators (Kubernetes, Railway, Render, Docker `HEALTHCHECK`) restart the container if `/health` fails or times out. It checks local process health (uptime, memory via `psutil`, etc.) and should **not** fail just because a temporary downstream issue occurs if restarting the pod wouldn't fix it.
+   - **Readiness (`/ready`)** answers *"Is this instance ready to accept traffic right now?"*. Load balancers/ingress check `/ready` to decide whether to route requests to the instance. In `05-scaling-reliability/develop/app.py`, `/ready` returns `503` when `_is_ready` is `False` (during startup model loading or during shutdown), and in `05-scaling-reliability/production/app.py`, `/ready` pings Redis and returns `503` if Redis is unreachable—stopping new traffic without needlessly restarting the container.
+2. **`SIGTERM` vs `SIGKILL`:**
+   - **`SIGTERM` (signal 15)** is catchable/handleable by the application. Container orchestrators send `SIGTERM` first when scaling down or rolling out a deploy. Uvicorn stops accepting new connections, `lifespan` sets `_is_ready = False` (so `/ready` returns `503`), and waits up to `timeout_graceful_shutdown=30` seconds for `_in_flight_requests` to finish before exiting cleanly.
+   - **`SIGKILL` (signal 9)** cannot be caught, ignored, or intercepted by the process—the kernel terminates the process immediately, severing active HTTP connections and risking corrupt/lost state. Platforms only send `SIGKILL` as a last resort if the process does not exit within the grace period after `SIGTERM`.
+
+---
+
+### Exercise 5.3: Stateless Design vs In-Memory State
+
+- **Why in-memory (RAM) state breaks in production:**
+  - If conversation history or session state is stored in a Python `dict` in process memory, each replica has its own isolated RAM. Behind a round-robin load balancer, Turn 1 may hit Instance 1 (saved in Instance 1's RAM) while Turn 2 hits Instance 2, which has no record of the session—breaking multi-turn conversations. Furthermore, any container restart, crash, or deploy wipes all in-memory sessions.
+- **How Redis solves it (`05-scaling-reliability/production/app.py`):**
+  - Application instances keep zero user/session state in local memory. `save_session()` serializes session data as JSON and writes it to shared **Redis** under `session:{session_id}` with a 1-hour TTL (`_redis.setex(f"session:{session_id}", 3600, serialized)`), while `load_session()` reads and deserializes from Redis on every request (keeping up to 20 messages / 10 turns).
+  - Because every replica reads/writes the same Redis store, any instance can serve any turn of any session seamlessly, and sessions survive individual agent restarts or horizontal scaling.
+
+---
+
+### Exercise 5.4 & 5.5: Load Balancing & Stateless Scaling Test (`05-scaling-reliability/production/`)
+
+#### 1. Stack Startup & Status (`docker compose -p k5-day14-scaling up -d --build --scale agent=3`)
+
+`docker compose -p k5-day14-scaling ps`:
+```text
+NAME                       IMAGE                    COMMAND                  SERVICE   CREATED          STATUS                    PORTS
+k5-day14-scaling-agent-1   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     20 seconds ago   Up 8 seconds (healthy)    8000/tcp
+k5-day14-scaling-agent-2   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     20 seconds ago   Up 7 seconds (healthy)    8000/tcp
+k5-day14-scaling-agent-3   k5-day14-scaling-agent   "python -m uvicorn a…"   agent     20 seconds ago   Up 7 seconds (healthy)    8000/tcp
+k5-day14-scaling-nginx-1   nginx:alpine             "/docker-entrypoint.…"   nginx     19 seconds ago   Up 7 seconds              0.0.0.0:8080->80/tcp, [::]:8080->80/tcp
+k5-day14-scaling-redis-1   redis:7-alpine           "docker-entrypoint.s…"   redis     20 seconds ago   Up 18 seconds (healthy)   6379/tcp
+```
+
+#### 2. `test_stateless.py` Full Output (hitting `http://localhost:8080/chat`)
+
+```text
+============================================================
+Stateless Scaling Demo
+============================================================
+
+Session ID: 875810c5-7341-4735-9632-49535ad7f6a1
+
+Request 1: [instance-56a471]
+  Q: What is Docker?
+  A: Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!...
+
+Request 2: [instance-066927]
+  Q: Why do we need containers?
+  A: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ O...
+
+Request 3: [instance-b66c96]
+  Q: What is Kubernetes?
+  A: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận....
+
+Request 4: [instance-56a471]
+  Q: How does load balancing work?
+  A: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ O...
+
+Request 5: [instance-066927]
+  Q: What is Redis used for?
+  A: Đây là câu trả lời từ AI agent (mock). Trong production, đây sẽ là response từ O...
+
+------------------------------------------------------------
+Total requests: 5
+Instances used: {'instance-066927', 'instance-b66c96', 'instance-56a471'}
+✅ All requests served despite different instances!
+
+--- Conversation History ---
+Total messages: 10
+  [user]: What is Docker?...
+  [assistant]: Container là cách đóng gói app để chạy ở mọi nơi. Build once...
+  [user]: Why do we need containers?...
+  [assistant]: Đây là câu trả lời từ AI agent (mock). Trong production, đây...
+  [user]: What is Kubernetes?...
+  [assistant]: Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã đư...
+  [user]: How does load balancing work?...
+  [assistant]: Đây là câu trả lời từ AI agent (mock). Trong production, đây...
+  [user]: What is Redis used for?...
+  [assistant]: Đây là câu trả lời từ AI agent (mock). Trong production, đây...
+
+✅ Session history preserved across all instances via Redis!
+```
+
+#### 3. Observations & Cleanup
+- Nginx (`nginx.conf`, port `8080`) distributes the 5 consecutive `/chat` requests in the same `session_id` across all 3 agent replicas (`instance-56a471`, `instance-066927`, `instance-b66c96`).
+- Fetching `GET /chat/{session_id}/history` returns all **10 messages** (5 user + 5 assistant) intact in order because all 3 instances read and write `session:{session_id}` in the shared `redis` container.
+- Stack torn down cleanly afterward via `docker compose -p k5-day14-scaling down -v`.
 
 ---
 
