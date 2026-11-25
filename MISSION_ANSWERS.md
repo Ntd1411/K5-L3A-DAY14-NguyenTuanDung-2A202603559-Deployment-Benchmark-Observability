@@ -270,6 +270,49 @@ X-XSS-Protection: 1; mode=block
 
 ---
 
+## Part 3: Cloud Deployment
+
+### Exercise 3.1: Railway Deployment (`06-lab-complete/` Agent + Redis)
+
+- **Platform:** Railway (`Root Directory`: `06-lab-complete`, built with multi-stage `Dockerfile` via `06-lab-complete/railway.toml`, connected to a Railway managed Redis database service via `${{Redis.REDIS_URL}}`)
+- **Public URL:** `https://k5-l3a-day14-nguyentuandung-2a202603559-deployme-production.up.railway.app`
+- **Deployment Info & Screenshots:**
+  - [DEPLOYMENT.md](DEPLOYMENT.md)
+  - [Deployment dashboard](screenshots/dashboard.png) (Agent + Redis services both `Online`)
+  - [Service running](screenshots/running.png) (`Active` deployment with structured JSON request logs)
+  - [Test results](screenshots/test.png) (4-check terminal output: `200`, `200`, `401`, `200`)
+
+**Live Endpoint Verification (CP6 self-check):**
+- `GET /health` → **HTTP 200** `{"status":"ok","environment":"production"}`
+- `GET /ready` → **HTTP 200** `{"status":"ready","redis":"ok"}` (verifies live Redis connectivity)
+- `POST /ask` (without `X-API-Key`) → **HTTP 401** `{"detail":"Invalid or missing API key"}`
+- `POST /ask` (with valid `X-API-Key` header `$AGENT_API_KEY`) → **HTTP 200** `{"question":"Hello","answer":"Agent đang hoạt động tốt! (mock response) Hỏi thêm câu hỏi đi nhé.","user_id":null,"cost_usd":8e-06}`
+
+---
+
+### Exercise 3.2: Comparison of `railway.toml` vs `render.yaml`
+
+Comparing `06-lab-complete/railway.toml` & `03-cloud-deployment/railway/railway.toml` against `06-lab-complete/render.yaml` & `03-cloud-deployment/render/render.yaml`:
+
+| Aspect | `railway.toml` | `render.yaml` | Why It Differs |
+|--------|----------------|---------------|----------------|
+| **Format & IaC Scope** | TOML (`[build]`, `[deploy]`) configuring **one service** per file. | YAML Blueprint (`services:` list) describing **multiple services** (web app + managed Redis) in one file. | Railway manages databases/services as canvas items in a project and uses `railway.toml` per service; Render Blueprint provisions the whole stack from one root manifest. |
+| **Build / Runtime** | `builder = "DOCKERFILE"` (or `"NIXPACKS"` with optional `startCommand = "uvicorn ... --port $PORT"`). | `runtime: docker` (or `runtime: python` with `buildCommand` and `startCommand`). | Railway auto-detects `Dockerfile` or falls back to Nixpacks; Render explicitly declares the runtime type and build/start commands in YAML. |
+| **Health Check & Restart** | `healthcheckPath = "/health"`, `healthcheckTimeout = 30`, `restartPolicyType = "ON_FAILURE"`. | `healthCheckPath: /health`, `autoDeploy: true`, plus `region` and `plan: free`. | Railway configures restart policy & timeout in TOML; Render embeds infrastructure tier (`plan`), `region`, and Git auto-deploy triggers in the Blueprint. |
+| **Secrets & Env Vars** | Variables and cross-service references (`${{Redis.REDIS_URL}}`, `AGENT_API_KEY`) are stored in Railway Dashboard/CLI, **not** inside `railway.toml`. | Env vars are declared in `envVars:` with `value:` for non-secrets and `generateValue: true` or `sync: false` for secrets. | Keeps secrets out of Git on both platforms while allowing Render Blueprints to declare required keys and auto-generate random keys (e.g. `AGENT_API_KEY`) on first deploy. |
+
+---
+
+### Exercise 3.3: GCP Cloud Run CI/CD Pipeline (`03-cloud-deployment/production-cloud-run/`)
+
+Reading `cloudbuild.yaml` and `service.yaml` shows a declarative automated CI/CD pipeline triggered on pushes to `main`:
+1. **Test (`cloudbuild.yaml` Step 1 — `test`):** Runs `pip install -r requirements.txt pytest` and `pytest tests/ -v --tb=short` inside `python:3.11-slim` to block broken builds before containerization.
+2. **Build & Push (`cloudbuild.yaml` Steps 2–3 — `build`, `push`):** Builds the Docker image tagged with both `$COMMIT_SHA` and `latest` (using `--cache-from` for faster builds) and pushes all tags to `gcr.io/$PROJECT_ID/ai-agent`.
+3. **Deploy (`cloudbuild.yaml` Step 4 — `deploy`):** Deploys the `$COMMIT_SHA` image to managed Cloud Run in `asia-southeast1` (`--allow-unauthenticated`, `min-instances=1`, `max-instances=10`, `512Mi` RAM, `1` CPU, `60s` timeout) and injects secrets from Google Secret Manager (`--set-secrets`).
+4. **Declarative Service Spec (`service.yaml`):** Defines the same Knative Service as Infrastructure-as-Code—setting `minScale: "1"` / `maxScale: "10"`, `containerConcurrency: 80`, resource requests/limits, `secretKeyRef` mounts (`OPENAI_API_KEY`, `AGENT_API_KEY`), and separate `livenessProbe` (`/health`) and `startupProbe` (`/ready`) checks.
+
+---
+
 ## Part 4: API Security (`04-api-gateway/`)
 
 ### Exercise 4.1: API Key Authentication (`04-api-gateway/develop/`)
@@ -655,3 +698,4 @@ Command: `cd 06-lab-complete && ../.venv/bin/python check_production_ready.py` (
 | **CP3 — API Security** | Explain API key auth, JWT auth, sliding-window rate limiting, and Redis Cost Guard (`04-api-gateway/`). | Summarized `rate_limiter.py` / `cost_guard.py` mechanics, zero-downtime key rotation, and Redis `INCRBYFLOAT` + `EXPIRE` key design. | Ran `04-api-gateway/develop` and `04-api-gateway/production` on port `8004`, executed live `curl -i` tests for `401`, `403`, `200`, and `429` (`Retry-After` / `X-RateLimit-*` headers), and redacted all JWT tokens before saving outputs. |
 | **CP4 — Scaling & Reliability** | Explain liveness vs readiness, `SIGTERM` vs `SIGKILL`, and Redis stateless session sharing (`05-scaling-reliability/`). | Drafted probe/signal explanations and Redis session serialization summary. | Ran `05-scaling-reliability/develop` on port `8005` and verified an in-flight 3s `/ask` request finished `200 OK` across `kill -TERM`; scaled `05-scaling-reliability/production` to `--scale agent=3`, ran `test_stateless.py` hitting all 3 instances with 10 intact messages, and ran `docker compose -p k5-day14-scaling down -v`. |
 | **CP5 — Final Project (`06-lab-complete/`)** | Implement all TODOs across `app/*.py`, `Dockerfile`, `.dockerignore`, `docker-compose.yml`, `.env.example`, `railway.toml`, and `render.yaml`. | Drafted `Settings`, lazy Redis client, `secrets.compare_digest` API key auth, Redis ZSET sliding-window rate limiter, Redis `INCRBYFLOAT` cost guard, JSON logging, `lifespan`, multi-stage Dockerfile, and PaaS manifests. | Verified `git diff 06-lab-complete/check_production_ready.py` is empty, ran `check_production_ready.py --static-only` (28/28) and full `check_production_ready.py` with Docker (`PASS 12/12`, `43/43 checks passed`, `235 MB` image), verified `docker compose config` without `.env`, tested clean `422` validation errors, and confirmed zero secrets/PII in staged files. |
+| **CP6 — Cloud Deployment** | Document Railway deployment (`DEPLOYMENT.md`) and answer Part 3 Exercise 3.1–3.3 (`railway.toml` vs `render.yaml`, Cloud Run CI/CD). | Structured `DEPLOYMENT.md`, the `railway.toml` vs `render.yaml` comparison table, and the 4-step `cloudbuild.yaml`/`service.yaml` pipeline summary. | Verified live Railway endpoints (`/health` → 200, `/ready` → 200, `/ask` unauthenticated → 401, `/ask` authenticated → 200), ran `check_production_ready.py --static-only --public-url ...`, converted/saved the 3 screenshots (`dashboard.png`, `running.png`, `test.png`), and verified no API keys or secrets appear in committed files. |
