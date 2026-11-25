@@ -131,7 +131,142 @@ content-type: application/json
 
 ## Part 2: Docker
 
-*(Pending CP2)*
+### Exercise 2.1: Basic Dockerfile (`02-docker/develop/Dockerfile`) Analysis
+
+1. **Base image:** `python:3.11` (L8) — the full Debian-based Python 3.11 image (~1 GB+ including compilers and system packages).
+2. **Working directory:** `/app` (L11: `WORKDIR /app`) — all subsequent relative `COPY`, `RUN`, and `CMD` paths execute inside `/app`.
+3. **Why `COPY 02-docker/develop/requirements.txt .` + `RUN pip install` before copying application code (`app.py`):** Docker caches each layer sequentially. Because `requirements.txt` changes far less often than `app.py`, installing dependencies before copying source code lets Docker reuse the cached `pip install` layer on code-only rebuilds instead of re-downloading and reinstalling packages every time.
+4. **`CMD` vs `ENTRYPOINT`:** `ENTRYPOINT` defines the fixed executable that always runs at container start (only overridden via `--entrypoint`), whereas `CMD` defines default arguments to `ENTRYPOINT` or the default command when no `ENTRYPOINT` is present (and can be overridden directly at the end of `docker run <image> <cmd>`). In `02-docker/develop/Dockerfile` (L30), `CMD ["python", "app.py"]` sets the default command.
+
+---
+
+### Exercise 2.2: Build & Run `my-agent:develop`
+
+- Built from repository root: `docker build -f 02-docker/develop/Dockerfile -t my-agent:develop .`
+- Checked `02-docker/develop/app.py` L20–L22: `@app.post("/ask")` accepts query parameter `question: str`.
+- Ran `docker run -d --rm --name cp2-dev -p 18003:8000 my-agent:develop` (mapped host port `18003` → container `8000` because host port `8000` was occupied by pre-existing `p108-backend-1`), tested `GET /health` and `POST /ask?question=What%20is%20Docker%3F`, then stopped with `docker stop cp2-dev`.
+
+**`GET /health` (`cp2-dev`):**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:16:13 GMT
+server: uvicorn
+content-length: 53
+content-type: application/json
+
+{"status":"ok","uptime_seconds":0.5,"container":true}
+```
+
+**`POST /ask?question=What%20is%20Docker%3F` (`cp2-dev`):**
+```http
+HTTP/1.1 200 OK
+date: Wed, 25 Nov 2026 07:16:13 GMT
+server: uvicorn
+content-length: 103
+content-type: application/json
+
+{"answer":"Container là cách đóng gói app để chạy ở mọi nơi. Build once, run anywhere!"}
+```
+
+- **Image size (`my-agent:develop`):** `1.66GB` disk usage (`426MB` content size), exact `docker image inspect` size = **`1,662,983,448` bytes (`1,662.98 MB` decimal / `1,585.94 MiB` binary)**.
+
+---
+
+### Exercise 2.3: Multi-Stage Build (`02-docker/production/Dockerfile`) & Size Comparison
+
+- **Stage 1 (`builder` — `FROM python:3.11-slim AS builder`):** Installs build-time OS packages (`gcc`, `libpq-dev`), copies `02-docker/production/requirements.txt`, and installs Python dependencies with `pip install --no-cache-dir --user -r requirements.txt` into `/root/.local`. This stage is used only for compilation and discarded from the final image.
+- **Stage 2 (`runtime` — `FROM python:3.11-slim AS runtime`):** Starts from a clean slim base image, creates a non-root user (`appuser`), copies only the installed packages (`COPY --from=builder /root/.local /home/appuser/.local`), copies `02-docker/production/main.py` and `utils/mock_llm.py`, sets `USER appuser`, defines `HEALTHCHECK`, and starts Uvicorn with 2 workers (`CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]`).
+- **Why smaller and safer:** Build tools (`gcc`, `libpq-dev`, apt caches) and the full Debian toolchain from `python:3.11` are excluded from the runtime image, shrinking attack surface and disk/pull size while running as non-root `appuser`.
+
+**Actual `docker images my-agent` output:**
+```text
+IMAGE               ID             DISK USAGE   CONTENT SIZE   EXTRA
+my-agent:advanced   7a39f637155e        237MB         57.4MB
+my-agent:develop    cd96b895a32a       1.66GB          426MB
+```
+
+**Actual `docker image inspect --format '{{.RepoTags}} {{.Size}}' my-agent:develop my-agent:advanced` output:**
+```text
+[my-agent:develop] 1662983448
+[my-agent:advanced] 237366004
+```
+
+| Image | Base / Strategy | Disk Usage (`docker images`) | Exact Size (Bytes) | Exact Size (MB, $10^6$ / MiB, $2^{20}$) |
+|-------|-----------------|------------------------------|--------------------|-----------------------------------------|
+| `my-agent:develop` | Single-stage `python:3.11` | `1.66GB` (content `426MB`) | `1,662,983,448` | `1,662.98 MB` (`1,585.94 MiB`) |
+| `my-agent:advanced` | Multi-stage `python:3.11-slim` | `237MB` (content `57.4MB`) | `237,366,004` | `237.37 MB` (`226.37 MiB`) |
+| **Reduction** | — | **-1.42 GB** | **-1,425,617,444** | **-1,425.62 MB (`-1,359.57 MiB`) — 85.73% smaller (7.01×)** |
+
+---
+
+### Exercise 2.4: Docker Compose Multi-Service Stack (`02-docker/production/`)
+
+#### Architecture Diagram
+
+```text
+                    Docker Bridge Network: internal
+                 ┌───────────────────────────────────────────┐
+                 │                                           │
+Client ──HTTP──▶ │  nginx (nginx:alpine)                     │
+  (host :80/443) │    │  rate limit: 10r/s (burst=20)        │
+                 │    │  security headers + proxy_pass       │
+                 │    ▼                                      │
+                 │  agent (my-agent runtime, :8000 internal) │
+                 │    ├──▶ redis (redis:7-alpine, :6379)     │
+                 │    │       └── volume: redis_data         │
+                 │    └──▶ qdrant (qdrant:v1.9.0, :6333)     │
+                 │            └── volume: qdrant_data        │
+                 └───────────────────────────────────────────┘
+```
+
+#### Services & Inter-Service Communication
+- **Services started (`docker compose -p k5-day14-docker up -d --build`):**
+  1. `redis` (`redis:7-alpine`, port `6379` internal, persistent `redis_data` volume, `redis-cli ping` healthcheck).
+  2. `qdrant` (`qdrant/qdrant:v1.9.0`, ports `6333-6334` internal, persistent `qdrant_data` volume, `/dev/tcp/localhost/6333` healthcheck).
+  3. `agent` (`02-docker/production/Dockerfile` `runtime` target, port `8000` internal only, `depends_on` `redis` and `qdrant` with `condition: service_healthy`, reads `.env.local`).
+  4. `nginx` (`nginx:alpine`, host ports `80:80` and `443:443`, mounts `./nginx/nginx.conf:ro`).
+- **How they communicate:** All four services share the private `internal` bridge network and resolve each other via Docker Compose DNS (`agent`, `redis`, `qdrant`). Only `nginx` exposes ports to the host; it terminates external HTTP traffic, enforces `limit_req` (`10r/s`, `burst=20`) on `/`, adds security headers (`X-Frame-Options: DENY`, `X-Content-Type-Options: nosniff`, `X-XSS-Protection`), and proxies requests to `http://agent_backend` (`server agent:8000`). Inside the network, `agent` connects to Redis via `REDIS_URL=redis://redis:6379/0` and Qdrant via `QDRANT_URL=http://qdrant:6333`.
+
+**`docker compose -p k5-day14-docker ps`:**
+```text
+NAME                       IMAGE                   COMMAND                  SERVICE   CREATED          STATUS                            PORTS
+k5-day14-docker-agent-1    k5-day14-docker-agent   "uvicorn main:app --…"   agent     14 seconds ago   Up 2 seconds (health: starting)   8000/tcp
+k5-day14-docker-nginx-1    nginx:alpine            "/docker-entrypoint.…"   nginx     14 seconds ago   Up 2 seconds                      0.0.0.0:80->80/tcp, [::]:80->80/tcp, 0.0.0.0:443->443/tcp, [::]:443->443/tcp
+k5-day14-docker-qdrant-1   qdrant/qdrant:v1.9.0    "./entrypoint.sh"        qdrant    15 seconds ago   Up 13 seconds (healthy)           6333-6334/tcp
+k5-day14-docker-redis-1    redis:7-alpine          "docker-entrypoint.s…"   redis     15 seconds ago   Up 13 seconds (healthy)           6379/tcp
+```
+
+**`curl -i http://localhost/health` (via Nginx):**
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 25 Nov 2026 07:16:42 GMT
+Content-Type: application/json
+Content-Length: 95
+Connection: keep-alive
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"status":"ok","uptime_seconds":0.8,"version":"2.0.0","timestamp":"2026-11-25T07:16:42.692509"}
+```
+
+**`curl -i -X POST http://localhost/ask -H "Content-Type: application/json" -d '{"question": "Explain microservices"}'` (via Nginx):**
+```http
+HTTP/1.1 200 OK
+Server: nginx
+Date: Wed, 25 Nov 2026 07:16:42 GMT
+Content-Type: application/json
+Content-Length: 103
+Connection: keep-alive
+X-Frame-Options: DENY
+X-Content-Type-Options: nosniff
+X-XSS-Protection: 1; mode=block
+
+{"answer":"Tôi là AI agent được deploy lên cloud. Câu hỏi của bạn đã được nhận."}
+```
+
+- **Cleanup verified:** `docker compose -p k5-day14-docker down -v` and `docker rmi my-agent:develop my-agent:advanced` removed all containers, volumes, networks, and images cleanly (`docker ps -a` confirmed zero `cp2-dev` or `k5-day14-docker-*` containers remaining).
 
 ---
 
